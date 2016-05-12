@@ -39,24 +39,24 @@
 #include <vm.h>
 #include <addrspace.h>
 #include <synch.h>
+#include <kern/file_syscalls.h>
+#include <kern/fcntl.h>
+#include <kern/seek.h>
+#include <vfs.h>
+#include <uio.h>
+#include <kern/iovec.h>
+#include <copyinout.h>
+#include <vnode.h>
+#include <kern/seek.h>
+#include <kern/stat.h>
 
 /*
- * Dumb MIPS-only "VM system" that is intended to only be just barely
- * enough to struggle off the ground. You should replace all of this
- * code while doing the VM assignment. In fact, starting in that
- * assignment, this file is not included in your kernel!
- *
- * NOTE: it's been found over the years that students often begin on
- * the VM assignment by copying dumbvm.c and trying to improve it.
- * This is not recommended. dumbvm is (more or less intentionally) not
- * a good design reference. The first recommendation would be: do not
- * look at dumbvm at all. The second recommendation would be: if you
- * do, be sure to review it from the perspective of comparing it to
- * what a VM system is supposed to do, and understanding what corners
- * it's cutting (there are many) and why, and more importantly, how.
+ * Custom implementation of VM to handle coremap, user pages and swapping.
  */
 
 struct spinlock mem_lock = SPINLOCK_INITIALIZER;
+struct vnode *swap_vnode;
+off_t swap_offset = 0;
 bool booted = false;
 
 static void
@@ -68,7 +68,39 @@ as_zero_region(paddr_t paddr, unsigned npages)
 void
 vm_bootstrap(void)
 {
-	/* Do nothing. */
+	int i;
+
+	/*if (booted == true) {
+		return;
+	}*/
+
+	char disk_name[] = "lhd0raw:";
+
+	int result = 0;
+	result = vfs_open(disk_name, O_RDWR, 0664, &swap_vnode);
+
+	if (result)
+		disk_enabled = FALSE;
+	else
+		disk_enabled = TRUE;
+
+	page_lock = lock_create("page_lock");
+	swap_table = NULL;
+	swap_table_free = NULL;
+
+	if (disk_enabled) {
+		swap_table_free = (swap_table_entry_t *) kmalloc((sizeof(swap_table_entry_t) * (MAX_SWAP_ENTRY)));
+
+		for (i = 0; i < MAX_SWAP_ENTRY - 1; i++) {
+			swap_table_free[i].next = &swap_table_free[i+1];
+			swap_table_free[i].offset = i * PAGE_SIZE;
+		}
+
+		swap_table_free[i].next = NULL;
+		swap_table_free[i].offset = i * PAGE_SIZE;
+	}
+
+	last_swapped_out_page_index = coremap_addr/PAGE_SIZE;
 	booted = true;
 }
 
@@ -85,6 +117,56 @@ dumbvm_can_sleep(void)
 
 }
 */
+
+/* Method to read from disk */
+
+static void
+swap_read(off_t offset, void *buf) {
+	int response = 0;
+	struct uio read_uio;
+	struct iovec read_iovec;
+
+	/* data and length */
+	read_iovec.iov_kbase = buf;
+	read_iovec.iov_len = PAGE_SIZE;
+
+	/* flags and references */
+	read_uio.uio_iovcnt = 1;
+	read_uio.uio_iov = &read_iovec;
+	read_uio.uio_segflg = UIO_SYSSPACE;
+	read_uio.uio_rw = UIO_READ;
+	read_uio.uio_space = NULL;
+	read_uio.uio_resid = PAGE_SIZE;
+	read_uio.uio_offset = offset;
+	response = VOP_READ(swap_vnode, &read_uio);
+	KASSERT(!response);
+	KASSERT(offset + PAGE_SIZE == read_uio.uio_offset);
+	return;
+}
+
+/* Method to write to disk */
+
+static void
+swap_write(swap_table_entry_t *ste, void *buf) {
+	struct uio write_uio;
+	struct iovec write_iovec;
+
+	/* data and length */
+	write_iovec.iov_kbase = buf;
+	write_iovec.iov_len = PAGE_SIZE;
+
+	/* flags and references */
+	write_uio.uio_iovcnt = 1;
+	write_uio.uio_iov = &write_iovec;
+	write_uio.uio_segflg = UIO_SYSSPACE;
+	write_uio.uio_rw = UIO_WRITE;
+	write_uio.uio_space = NULL;
+	write_uio.uio_resid = PAGE_SIZE;
+	write_uio.uio_offset = ste->offset;
+	VOP_WRITE(swap_vnode, &write_uio);
+}
+
+/* Method to get physical pages */
 
 static
 paddr_t
@@ -117,7 +199,8 @@ getppages(unsigned long npages)
 
 	while(count > 0) {
 		coremap[i].state = FIXED;
-
+		coremap[i].pte = NULL;
+		coremap[i].is_user = FALSE;
 		if (count == 1) {
 			coremap[i].chunk_size = npages;
 			break;
@@ -133,7 +216,231 @@ getppages(unsigned long npages)
 	return i * PAGE_SIZE;
 }
 
+/* Method to retrieve user pages */
+
+static paddr_t
+get_user_pages(unsigned npages)
+{
+	unsigned long count = 0, tmp_page_cnt, page_counter = ram_getsize() / PAGE_SIZE, i;
+	unsigned int last_swapped = last_swapped_out_page_index;
+	tmp_page_cnt = page_counter;
+
+	spinlock_acquire(&mem_lock);
+
+	if (last_swapped_out_page_index + 1 == page_counter) {
+		last_swapped = coremap_addr / PAGE_SIZE;
+		tmp_page_cnt = 0;
+	}
+
+	for(i = last_swapped + 1; i < page_counter; i++) {
+		if (coremap[i].state == FIXED && coremap[i].is_user == TRUE) {
+			KASSERT(coremap[i].pte);
+			count++;
+
+			if (count == npages) {
+				i++;
+				break;
+			}
+
+		} else {
+			count = 0;
+		}
+
+		if ((i == page_counter - 1) && (tmp_page_cnt == page_counter)) {
+			page_counter = last_swapped + 1;
+			i = coremap_addr/PAGE_SIZE - 1;
+			count = 0;
+		}
+	}
+
+	if (count < npages) {
+		spinlock_release(&mem_lock);
+		return 0;
+	}
+
+	last_swapped_out_page_index = i - 1;
+
+	for (; count > 0; count--) {
+		i--;
+		coremap[i].is_user = FALSE;
+	}
+	coremap[i].chunk_size = npages;
+	spinlock_release(&mem_lock);
+
+	return i * PAGE_SIZE;
+}
+
+/* Lookup swap table data structure for entry */
+
+static swap_table_entry_t *
+swap_table_lookup(struct page_table *pte)
+{
+	swap_table_entry_t *temp = swap_table;
+
+	while(temp) {
+		if (temp->as == pte->as && temp->vpn == pte->vpn) {
+			return temp;
+		}
+		temp = temp->next;
+	}
+	return NULL;
+}
+
+/* Insert into swap table */
+
+static void
+swap_table_add(swap_table_entry_t *ste, struct page_table *pte)
+{
+	ste->as = pte->as;
+	ste->vpn = pte->vpn;
+	pte->state = PAGE_IN_DISK;
+	if (swap_table == NULL) {
+		swap_table = ste;
+		ste->next = NULL;
+	} else {
+		ste->next = swap_table;
+		swap_table = ste;
+	}
+}
+
+/* Remove from swap_table using the below methods - swap_table_remove() and swap_table_entry_delete */
+
+static swap_table_entry_t *
+swap_table_remove(struct page_table *pte)
+{
+	swap_table_entry_t *prev = NULL, *temp = swap_table;
+
+	while(temp) {
+		if (temp->as == pte->as && temp->vpn == pte->vpn) {
+			if (prev == NULL) {
+				swap_table = swap_table->next;
+			} else {
+				prev->next = temp->next;
+			}
+			return temp;
+		}
+		prev = temp;
+		temp = temp->next;
+	}
+	return NULL;
+}
+
+
+
+void
+swap_table_entry_delete(struct page_table *pte) {
+	swap_table_entry_t *ste = swap_table_remove(pte);
+	ste->next = swap_table_free;
+	swap_table_free = ste;
+}
+
+/* Method to swap out pages to disk */
+
+static paddr_t
+swap_out_pages(int npages)
+{
+	paddr_t ppn, tmp;
+	swap_table_entry_t *ste;
+	int i, size, spl;
+
+	/* Disable interrupts on this CPU while frobbing the TLB. */
+	spl = splhigh();
+
+	ppn = get_user_pages(npages);
+	if (ppn == 0) {
+		splx(spl);
+		return 0;
+	}
+
+	tmp = ppn;
+	for(i = 1; i <= npages; i++) {
+		ste = swap_table_free;
+		swap_table_free = swap_table_free->next;
+
+		KASSERT(ste);
+
+		swap_write(ste, (void *)PADDR_TO_KVADDR(tmp));
+
+		swap_table_add(ste, coremap[tmp/PAGE_SIZE].pte);
+		coremap[tmp/PAGE_SIZE].pte = NULL;
+
+		if (size) {
+
+		}
+		tmp += PAGE_SIZE;
+	}
+
+	for (i=0; i<NUM_TLB; i++) {
+		tlb_write(TLBHI_INVALID(i), TLBLO_INVALID(), i);
+	}
+
+	ipi_broadcast(IPI_TLBSHOOTDOWN);
+
+	splx(spl);
+
+	return ppn;
+}
+
+/* Method to swap in pages from disk. */
+
+static int
+swap_in_page(struct page_table *pte)
+{
+	paddr_t ppn;
+
+	KASSERT(pte);
+	ppn = getppages(1);
+
+	if (ppn == 0) {
+		ppn = swap_out_pages(1);
+		KASSERT(ppn);
+		if (ppn == 0) {
+			return 0;
+		}
+	}
+
+	coremap[ppn/PAGE_SIZE].is_user = TRUE;
+	coremap[ppn/PAGE_SIZE].pte = pte;
+
+	swap_table_entry_t *ste = swap_table_remove(pte);
+	KASSERT(ste != NULL);
+
+	swap_read(ste->offset, (void *)PADDR_TO_KVADDR(ppn));
+
+	ste->next = swap_table_free;
+	swap_table_free = ste;
+
+	pte->ppn = ppn;
+	pte->state = PAGE_IN_RAM;
+
+	return 1;
+}
+
+/* Copy swap pages */
+
+static void
+swap_copy(struct page_table *newp, struct page_table *oldp)
+{
+	swap_table_entry_t *ste, *ste_old;
+	char buf[PAGE_SIZE];
+
+	ste = swap_table_free;
+	swap_table_free = swap_table_free->next;
+
+	KASSERT(ste);
+
+	ste_old = swap_table_lookup(oldp);
+	KASSERT(ste_old);
+	swap_read(ste_old->offset, (void *)buf);
+
+	swap_write(ste, (void *)buf);
+	swap_table_add(ste, newp);
+
+	return;
+}
+
 /* Allocate/free some kernel-space virtual pages */
+
 vaddr_t
 alloc_kpages(unsigned npages)
 {
@@ -141,10 +448,22 @@ alloc_kpages(unsigned npages)
 	paddr_t pa;
 	pa = getppages(npages);
 	if (pa==0) {
+		if (booted && disk_enabled) {
+			lock_acquire(page_lock);
+			pa = swap_out_pages(npages);
+			if (pa == 0) {
+				lock_release(page_lock);
+				return 0;
+			}
+			lock_release(page_lock);
+			return PADDR_TO_KVADDR(pa);
+		}
 		return 0;
 	}
 	return PADDR_TO_KVADDR(pa);
 }
+
+/* Custom implementation to free pages */
 
 void
 free_kpages(vaddr_t addr)
@@ -160,13 +479,17 @@ free_kpages(vaddr_t addr)
 	coremap[index].chunk_size = 0;
 
 	for (int i = 0; i < pages; i++) {
-		coremap[index + i].state = FREE;
+		coremap[index+i].is_user = FALSE;
+		coremap[index+i].state = FREE;
+		coremap[index+i].pte = NULL;
 	}
 
 	if (booted) {
 		spinlock_release(&mem_lock);
 	}
 }
+
+/* Calculate bytes used by the allocated pages of the CoreMap */
 
 unsigned
 int
@@ -204,6 +527,8 @@ vm_tlbshootdown(const struct tlbshootdown *ts)
 	panic("dumbvm tried to do tlb shootdown?!\n");
 }
 
+/* Custom implementation of vm_fault */
+
 int
 vm_fault(int faulttype, vaddr_t faultaddress)
 {
@@ -236,6 +561,10 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 
 	bool found = false;
 
+
+	/* Disable interrupts on this CPU while frobbing the TLB. */
+	spl = splhigh();
+
 	struct page_table *temp = as->page_table_entry;
 	struct page_table *last_page = as->page_table_entry;
 
@@ -247,11 +576,14 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 		case VM_FAULT_WRITE: {
 
 			/* Bad Call Checks */
-			if (faultaddress >= as->heap_end && faultaddress < USERSTACK - 1024 * PAGE_SIZE)
+			if (faultaddress >= as->heap_end && faultaddress < USERSTACK - 1024 * PAGE_SIZE) {
 				return EFAULT;
+			}
 
-			if (faultaddress >= USERSTACK)
+			if (faultaddress >= USERSTACK) {
+				KASSERT(0);
 				return EFAULT;
+			}
 
 			if (faultaddress < as->heap_start) {
 				struct region *temp_region = as->addr_regions;
@@ -262,8 +594,9 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 						break;
 					} else {
 						temp_region = temp_region->next;
-						if (temp_region == NULL)
+						if (temp_region == NULL) {
 							return EFAULT;
+						}
 					}
 				}
 			}
@@ -278,18 +611,49 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 				temp = temp->next;
 			}
 
-			if (!found) {
+			if (found) {
+				lock_acquire(page_lock);
+				/* Handle if memory is in ram or disk */
+				if (temp->state != PAGE_IN_RAM) {
+					/* bring it to the RAM */
+					swap_in_page(temp);
+				}
+				lock_release(page_lock);
+			} else {
 				temp = (struct page_table *) kmalloc(sizeof(struct page_table));
-
-				if (temp == NULL)
+				if (temp == NULL) {
+					KASSERT(0);
 					return ENOMEM;
+				}
 
 				temp->vpn = faultaddress;
 				temp->ppn = getppages(1);
 
 				if (temp->ppn == 0) {
-					return ENOMEM;
+					if (disk_enabled) {
+						lock_acquire(page_lock);
+						temp->ppn = swap_out_pages(1);
+						if (temp->ppn == 0) {
+							KASSERT(0);
+							lock_release(page_lock);
+							return ENOMEM;
+						}
+						lock_release(page_lock);
+					} else {
+						KASSERT(0);
+						return ENOMEM;
+					}
 				}
+
+				temp->state = PAGE_IN_RAM;
+
+				spinlock_acquire(&mem_lock);
+
+				coremap[temp->ppn/PAGE_SIZE].is_user = TRUE;
+				coremap[temp->ppn/PAGE_SIZE].pte = temp;
+				temp->as = as;
+
+				spinlock_release(&mem_lock);
 
 				as_zero_region(temp->ppn, 1);
 				temp->next = NULL;
@@ -302,19 +666,16 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 					last_page->next = temp;
 				}
 			}
-
 			break;
 		}
 		default:
+			KASSERT(0);
 			return EINVAL;
 	}
 
 	paddr = temp->ppn;
 	/* make sure it's page-aligned */
 	KASSERT((paddr & PAGE_FRAME) == paddr);
-
-	/* Disable interrupts on this CPU while frobbing the TLB. */
-	spl = splhigh();
 
 	ehi = faultaddress;
 	elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
@@ -324,10 +685,13 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 
 }
 
+/* Address space methods */
+
 struct addrspace *
 as_create(void)
 {
-	struct addrspace *as = kmalloc(sizeof(struct addrspace));
+	struct addrspace *as = NULL;
+	as = kmalloc(sizeof(struct addrspace));
 
 	if (as==NULL) {
 		return NULL;
@@ -358,7 +722,14 @@ as_destroy(struct addrspace *as) {
 	while (temp != NULL) {
 		page_temp = temp->next;
 
-		kfree((void *)PADDR_TO_KVADDR(temp->ppn));
+		lock_acquire(page_lock);
+		if (temp->state == PAGE_IN_DISK) {
+			swap_table_entry_delete(temp);
+		} else {
+			kfree((void *)PADDR_TO_KVADDR(temp->ppn));
+		}
+		lock_release(page_lock);
+
 		kfree(temp);
 		temp = page_temp;
 	}
@@ -377,6 +748,7 @@ as_activate(void)
 		return;
 	}
 
+	as->parent_as = NULL;
 	/* Disable interrupts on this CPU while frobbing the TLB. */
 	spl = splhigh();
 
@@ -395,7 +767,7 @@ as_deactivate(void)
 
 int
 as_define_region(struct addrspace *as, vaddr_t vaddr, size_t sz,
-		 int readable, int writeable, int executable)
+				 int readable, int writeable, int executable)
 {
 	size_t npages;
 
@@ -476,6 +848,7 @@ as_copy(struct addrspace *old, struct addrspace **ret)
 	}
 
 	target->page_table_entry = NULL;
+	target->parent_as = old;
 
 	struct page_table *new_pg_table;
 	struct page_table *old_pg_table = old->page_table_entry;
@@ -489,20 +862,46 @@ as_copy(struct addrspace *old, struct addrspace **ret)
 		if (new_pg_table == NULL) {
 			return ENOMEM;
 		}
-
 		new_pg_table->vpn = old_pg_table->vpn;
-		address = getppages(1);
+		new_pg_table->as = target;
 
-		if (address == 0)
-			return ENOMEM;
+		lock_acquire(page_lock);
+		if (old_pg_table->state == PAGE_IN_RAM) {
+			address = getppages(1);
+			if (address == 0) {
+				if (disk_enabled) {
+					address = swap_out_pages(1);
+					if (address == 0) {
+						lock_release(page_lock);
+						/* TODO: free all new page table entries created so far */
+						kfree(new_pg_table);
+						return ENOMEM;
+					}
+				} else {
+					lock_release(page_lock);
+					/* TODO: free all new page table entries created so far */
+					kfree(new_pg_table);
+					return ENOMEM;
+				}
+			}
 
-		new_pg_table->ppn = address;
-		as_zero_region(address, 1);
+			new_pg_table->ppn = address;
+			new_pg_table->state = PAGE_IN_RAM;
+			coremap[address/PAGE_SIZE].is_user = TRUE;
+			coremap[address/PAGE_SIZE].pte = new_pg_table;
 
-		memmove((void *) PADDR_TO_KVADDR(new_pg_table->ppn),
-				(const void *) PADDR_TO_KVADDR(old_pg_table->ppn), PAGE_SIZE);
+			as_zero_region(address, 1);
 
+			memmove((void *) PADDR_TO_KVADDR(new_pg_table->ppn),
+					(const void *) PADDR_TO_KVADDR(old_pg_table->ppn), PAGE_SIZE);
+			lock_release(page_lock);
+		} else {
+			new_pg_table->state = PAGE_IN_DISK;
+			lock_release(page_lock);
+			swap_copy(new_pg_table, old_pg_table);
+		}
 		new_pg_table->next = NULL;
+
 		old_pg_table = old_pg_table->next;
 
 		if (page_table_last == NULL) {
@@ -526,11 +925,10 @@ as_copy(struct addrspace *old, struct addrspace **ret)
 	while(old_region != NULL) {
 		new_region = kmalloc(sizeof(struct region));
 
-		if(new_region == NULL){
+		if(new_region == NULL) {
+			/* TODO: free all new page table entries created so far */
 			return ENOMEM;
 		}
-
-		//as_zero_region(KVADDR_TO_PADDR((vaddr_t)new_region), 1);
 
 		new_region->region_start = old_region->region_start;
 		new_region->region_size = old_region->region_size;
@@ -554,5 +952,7 @@ as_copy(struct addrspace *old, struct addrspace **ret)
 	target->heap_end = old->heap_end;
 
 	*ret = target;
+
 	return 0;
 }
+

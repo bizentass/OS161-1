@@ -19,7 +19,8 @@
 #include <spl.h>
 
 
-/* Spawning new process ids */
+/* Spawning a new process id */
+
 pid_t
 spawn_pid(struct proc *proc, int *err) {
 
@@ -43,10 +44,14 @@ spawn_pid(struct proc *proc, int *err) {
     return -1;
 }
 
+/* Get id of current process */
+
 pid_t
 sys_getpid() {
     return curproc->pid;
 }
+
+/* Custom implementation of fork kernel system call */
 
 int
 sys_fork(struct trapframe* tf, int *err) {
@@ -112,6 +117,8 @@ child_forkentry(void *data1, unsigned long data2){
 
     mips_usermode(&st_trapframe);
 };
+
+/* Custom implementation of exec kernel system call */
 
 int
 sys_execv(char *progname, char **args, int *err) {
@@ -293,6 +300,8 @@ sys_execv(char *progname, char **args, int *err) {
     return -1;
 }
 
+/* Custom implementation of waitpid kernel system call */
+
 pid_t
 sys_waitpid(pid_t pid, int *status, int options, int *err) {
 
@@ -354,6 +363,8 @@ sys_waitpid(pid_t pid, int *status, int options, int *err) {
     return pid;
 }
 
+/* Custom implementation of exit kernel system call */
+
 void sys_exit(int exitcode, bool is_sig){
 
     lock_acquire(curproc->exitlock);
@@ -389,6 +400,8 @@ void sys_exit(int exitcode, bool is_sig){
     thread_exit();
 }
 
+/* Custom implementation of sbrk kernel system call */
+
 void *
 sys_sbrk(intptr_t amount, int *err){
 
@@ -404,7 +417,7 @@ sys_sbrk(intptr_t amount, int *err){
         return (void *)-1;
     }
 
-    if (curproc->p_addrspace->heap_start + amount >= USERSTACK - 1024 * PAGE_SIZE)  {
+    if (curproc->p_addrspace->heap_end + amount >= USERSTACK - 1024 * PAGE_SIZE)  {
         *err = ENOMEM;
         return (void *)-1;
     }
@@ -427,7 +440,7 @@ sys_sbrk(intptr_t amount, int *err){
     if(amount < 0) {
         for (int i = 1; i <= num_pages; i++) {
 
-            // Page Table removal loop through the page table and remove entries correspondingly.
+            // Page table removal :-  Loop through the page table and remove entries correspondingly
 
             proc_pg_table = curproc->p_addrspace->page_table_entry;
             prev_proc_pg_table = proc_pg_table;
@@ -439,7 +452,13 @@ sys_sbrk(intptr_t amount, int *err){
                     prev_proc_pg_table->next = proc_pg_table->next;
 
                     free_proc_pg_table = proc_pg_table;
-                    kfree((void *)PADDR_TO_KVADDR(free_proc_pg_table->ppn));
+                    lock_acquire(page_lock);
+                    if (free_proc_pg_table->state == PAGE_IN_DISK) {
+                        swap_table_entry_delete(free_proc_pg_table);
+                    } else {
+                        kfree((void *) PADDR_TO_KVADDR(free_proc_pg_table->ppn));
+                    }
+                    lock_release(page_lock);
                     kfree(free_proc_pg_table);
 
                     break;

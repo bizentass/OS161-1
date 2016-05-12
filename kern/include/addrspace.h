@@ -40,6 +40,8 @@
 
 struct vnode;
 
+#define PAGE_IN_RAM  0
+#define PAGE_IN_DISK 1
 
 /*
  * Address space - data structure associated with the virtual memory
@@ -48,25 +50,23 @@ struct vnode;
  * You write this.
  */
 
-/* Address space Region */
+/* Address space region definition */
 struct region {
     vaddr_t region_start;
     size_t region_size;
-    //int permission:3;
     struct region *next;
 };
 
-/* Page Table Entry structure */
-struct
-page_table {
+/* Page Table structure */
+struct page_table {
     vaddr_t vpn;
     paddr_t ppn;
-   // int permission:4;
-   // bool state:1;
-   // bool is_valid:1;
-   // bool is_referenced:1;
+    bool state:1;
+    struct addrspace *as;
     struct page_table *next;
 };
+
+/* Address space definition */
 
 struct addrspace {
 #if OPT_DUMBVM
@@ -78,13 +78,31 @@ struct addrspace {
     size_t as_npages2;
     paddr_t as_stackpbase;
 #else
-    /* Put stuff here for your VM system */
     struct region *addr_regions;
     vaddr_t heap_start;
     vaddr_t heap_end;
     struct page_table *page_table_entry;
+    struct addrspace *parent_as;
 #endif
 };
+
+/* Swap Table structure */
+
+typedef struct swap_table_entry {
+    struct addrspace *as;
+    vaddr_t          vpn;
+    off_t            offset;
+    struct swap_table_entry *next;
+} swap_table_entry_t;
+
+swap_table_entry_t *swap_table;
+swap_table_entry_t *swap_table_free;
+unsigned int last_swapped_out_page_index;
+bool disk_enabled;
+
+#define MAX_SWAP_ENTRY 8192
+
+struct lock *page_lock;
 
 /*
  * Functions in addrspace.c:

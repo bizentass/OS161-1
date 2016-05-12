@@ -32,30 +32,40 @@
 
 #include <spinlock.h>
 
-/*
- * VM system-related definitions.
- *
- * You'll probably want to add stuff here.
- */
 
-/* CoreMap Start Physical Address */
+/* CoreMap start of physical address */
+
 paddr_t coremap_addr;
+paddr_t swap_addr;
 
-/* CoreMap DataStructure */
+#define FREE    0
+#define DIRTY   1
+#define FIXED   2
+#define CLEAN   3
+
+#define TRUE    1
+#define FALSE   0
+
+/* CoreMap data structure */
+
 struct
 coremap_entry {
-    enum states { FREE, DIRTY, FIXED, CLEAN } state;
-    int chunk_size;
+    char state;
+    char is_user;
+    short chunk_size;
+    struct page_table *pte;
 };
 
 extern bool booted;
 
-/* CoreMap Array Pointer */
+/* CoreMap array pointer */
+
 struct coremap_entry *coremap;
 
 #include <machine/vm.h>
 
 /* Fault-type arguments to vm_fault() */
+
 #define VM_FAULT_READ        0    /* A read was attempted */
 #define VM_FAULT_WRITE       1    /* A write was attempted */
 #define VM_FAULT_READONLY    2    /* A write to a readonly page was attempted*/
@@ -69,18 +79,21 @@ void vm_bootstrap(void);
 /* Fault handling function called by trap code */
 int vm_fault(int faulttype, vaddr_t faultaddress);
 
+void swap_table_entry_delete(struct page_table *pte);
+
 /* Allocate/free kernel heap pages (called by kmalloc/kfree) */
 vaddr_t alloc_kpages(unsigned npages);
 void free_kpages(vaddr_t addr);
 
 /*
- * Return amount of memory (in bytes) used by allocated coremap pages.  If
+ * Return amount of memory (in bytes) used by allocated core map pages.  If
  * there are ongoing allocations, this value could change after it is returned
  * to the caller. But it should have been correct at some point in time.
  */
 unsigned int coremap_used_bytes(void);
 
 /* TLB shootdown handling called from interprocessor_interrupt */
+
 void vm_tlbshootdown_all(void);
 void vm_tlbshootdown(const struct tlbshootdown *);
 

@@ -31,6 +31,7 @@
 #include <lib.h>
 #include <vm.h>
 #include <mainbus.h>
+#include <addrspace.h>
 
 
 vaddr_t firstfree;   /* first free virtual address; set by start.S */
@@ -42,6 +43,7 @@ static paddr_t lastpaddr;   /* one past end of last free physical page */
  * Called very early in system boot to figure out how much physical
  * RAM is available.
  */
+
 void
 ram_bootstrap(void)
 {
@@ -70,7 +72,7 @@ ram_bootstrap(void)
 	firstpaddr = firstfree - MIPS_KSEG0;
 
 	kprintf("%uk physical memory available\n",
-		(lastpaddr-firstpaddr)/1024);
+			(lastpaddr-firstpaddr)/1024);
 }
 
 /*
@@ -152,12 +154,16 @@ ram_getfirstfree(void)
 	return ret;
 }
 
-/* Initialize CoreMap Structure and Pages */
+/* Initialize CoreMap and pages */
+
 void
 coremap_bootstrap(void)
 {
 	int total_pages = lastpaddr / PAGE_SIZE;
-	int pages = sizeof(struct coremap_entry) * total_pages/PAGE_SIZE;
+
+	int pages, i;
+
+	pages = sizeof(struct coremap_entry) * total_pages/PAGE_SIZE;
 	if ((sizeof(struct coremap_entry) * total_pages) % PAGE_SIZE > 0) {
 		pages++;
 	}
@@ -167,15 +173,18 @@ coremap_bootstrap(void)
 
 	int allocated_pages = firstpaddr / PAGE_SIZE;
 
-	for(int i = 0; i < allocated_pages; i++) {
+	for(i = 0; i < allocated_pages; i++) {
 		coremap[i].state = FIXED;
+		coremap[i].is_user = FALSE;
 	}
 
 	int free_pages = total_pages - allocated_pages;
 
-	for(int i = allocated_pages; i < free_pages; i++) {
+	for(i = allocated_pages; i < free_pages; i++) {
 		coremap[i].state = FREE;
 		coremap[i].chunk_size = 0;
+		coremap[i].is_user = FALSE;
+		coremap[i].pte = NULL;
 	}
 
 	booted = false;
