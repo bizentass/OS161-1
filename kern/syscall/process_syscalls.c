@@ -484,8 +484,5 @@ sys_sbrk(intptr_t amount, int *err){
 
     curproc->p_addrspace->heap_end += amount;
 
-    if (amount < 0)
-        as_activate();
-
     return (void *)retval;
 }

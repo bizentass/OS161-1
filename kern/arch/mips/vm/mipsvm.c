@@ -422,7 +422,7 @@ static void
 swap_copy(struct page_table *newp, struct page_table *oldp)
 {
 	swap_table_entry_t *ste, *ste_old;
-	char buf[PAGE_SIZE];
+	char* buf = (char*) kmalloc(PAGE_SIZE);
 
 	ste = swap_table_free;
 	swap_table_free = swap_table_free->next;
@@ -436,6 +436,7 @@ swap_copy(struct page_table *newp, struct page_table *oldp)
 	swap_write(ste, (void *)buf);
 	swap_table_add(ste, newp);
 
+	kfree(buf);
 	return;
 }
 
